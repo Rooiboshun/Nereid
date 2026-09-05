@@ -302,6 +302,8 @@ const MY_ID = Math.random().toString(36).slice(2,10);
 let mode = "idle";            // idle | drill | online
 let nick = "";
 let myReady = false;
+let showBrief = false;        // 「説明に戻る」を押した本人だけ説明画面にする
+let lastVeilKey = "";         // 幕の再描画が要るかの判定用
 let roomCode = "";
 
 let sb = null, ch = null;
@@ -400,7 +402,6 @@ function startDive(){
   const seats = mode === "drill" ? ["_a","_b","_c"] : roster.slice(0,3).map(p => p.id);
   Object.assign(game, newGame(), { ph:"dive", seats });
   resetPanels();
-  myReady = false;
   const idx = seats.map((_,i)=>i);
   for(const s of idx) game.prev[s] = Object.assign({}, panels[s]);
   for(const s of idx) game.o[s] = makeOrder(s, idx, game);
@@ -417,7 +418,8 @@ function applyAct(seat, ctrlId, v){
 
 function captainTick(){
   const st = game;
-  if(st.ph === "lobby"){
+  // 潜航前(lobby)も結果表示中(over)も、全員が配置についた時点で開始する
+  if(st.ph === "lobby" || st.ph === "over"){
     if(mode === "online" && roster.length >= 2 && roster.slice(0,3).every(p => p.ready)) startDive();
     return;
   }
@@ -794,10 +796,26 @@ const card = document.getElementById("card");
 const esc = s => String(s).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 
 function drawVeil(){
+  // 幕はカードごと作り直すので、入力中の焦点とカーソル位置を持ち越す
+  const a = document.activeElement;
+  const fid = (a && a.id) ? a.id : null;
+  const pos = (a && typeof a.selectionStart === "number") ? a.selectionStart : null;
+  renderVeil();
+  if(fid){
+    const el = document.getElementById(fid);
+    if(el && el !== document.activeElement){
+      el.focus();
+      if(pos !== null && typeof el.selectionStart === "number"){
+        try{ el.setSelectionRange(pos, pos); }catch(e){}
+      }
+    }
+  }
+}
+function renderVeil(){
   const st = view();
-  if(mode !== "idle" && st && st.ph === "dive"){ veil.hidden = true; return; }
+  if(mode !== "idle" && st && st.ph === "dive"){ veil.hidden = true; showBrief = false; return; }
   veil.hidden = false;
-  if(st && st.ph === "over") return drawResult(st);
+  if(st && st.ph === "over" && !showBrief) return drawResult(st);
   drawBriefing();
 }
 
@@ -877,6 +895,8 @@ function drawBriefing(){
   });
 }
 
+const readyCount = () => roster.filter(p => p.ready).length;
+
 function drawResult(st){
   card.innerHTML = `
     <h1>${st.win ? "海溝底に到達" : "圧壊"}</h1>
@@ -892,20 +912,22 @@ function drawResult(st){
     <p class="lede">${st.win
       ? "全員の声が通っていた。ネレイドは海溝底に着底し、採泥装置を展開した。"
       : "誰かの指令が誰にも届かないまま、水圧が耐圧殻を上回った。もう一度潜れ。"}</p>
+    ${mode === "drill" ? "" :
+      `<div class="status${readyCount() >= roster.length && roster.length >= 2 ? " live" : ""}">` +
+      `<i class="dot"></i>再挑戦 ${readyCount()} / ${roster.length} 人 — 全員が押すと次の潜航が始まる</div>`}
     <div class="acts">
-      <button class="btn" id="againBtn">${mode === "drill" ? "もう一度潜る" : (myReady ? "配置を解く" : "もう一度潜る")}</button>
+      <button class="btn" id="againBtn">${mode === "drill" ? "もう一度潜る" : (myReady ? "取り消す" : "もう一度潜る")}</button>
       <button class="btn btn--ghost" id="backBtn">説明に戻る</button>
     </div>`;
   card.querySelector("#againBtn").addEventListener("click", () => {
     if(mode === "drill"){ startDive(); drawVeil(); return; }
-    myReady = !myReady;
-    if(amCaptain() && game){ game.ph = "lobby"; game.ev = []; broadcastState(true); }
+    myReady = !myReady;              // 全員が押した時点で艇長が次の潜航を始める
     trackMe(); drawVeil();
   });
   card.querySelector("#backBtn").addEventListener("click", () => {
     if(mode === "drill"){ mode = "idle"; game = null; ui.rendered = null; layout(); }
-    else if(amCaptain() && game){ game.ph = "lobby"; broadcastState(true); }
-    myReady = false; trackMe(); drawCrew(); drawVeil();
+    myReady = false; showBrief = true;   // 説明画面は押した本人にだけ出す
+    trackMe(); drawCrew(); drawVeil();
   });
 }
 
@@ -919,16 +941,30 @@ let prevPhase = null;
 setInterval(() => {
   if((mode === "drill" || (mode === "online" && amCaptain())) && game) captainTick();
   if(mode === "online") broadcastState(false);
-}, 100);
 
-function frame(){
+  // 局面の変化もここで拾う。frame() は裏タブで止まるため当てにできない。
   const st = view();
   const ph = st ? st.ph : null;
   if(ph !== prevPhase){
     prevPhase = ph;
-    if(ph === "dive"){ ui.rendered = null; layout(); }
+    if(ph === "dive"){
+      // 潜航が始まったら配置の申告を必ず落とす。残したままだと結果画面から
+      // 戻った瞬間に全員READY扱いになり、勝手に次の潜航が始まってしまう。
+      myReady = false; trackMe();
+      showBrief = false; ui.rendered = null; layout();
+    }
     drawVeil(); drawCrew();
   }
+
+  // 幕が出ている間は、他の乗員の配置状況を追随させる
+  if(!veil.hidden){
+    const key = ph + "|" + showBrief + "|" + myReady + "|" +
+                roster.map(p => p.id + (p.ready ? "1" : "0") + p.name).join(",");
+    if(key !== lastVeilKey){ lastVeilKey = key; drawVeil(); drawCrew(); }
+  }
+}, 100);
+
+function frame(){
   paintRail(); paintOrders(); paintControls(); playEvents();
   requestAnimationFrame(frame);
 }
